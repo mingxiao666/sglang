@@ -22,7 +22,7 @@ from typing import Optional
 
 import psutil
 import torch
-
+import nvtx
 from sglang.srt.managers.io_struct import (
     GetWeightsByNameReqInput,
     InitWeightsUpdateGroupReqInput,
@@ -121,6 +121,7 @@ class TpModelWorkerClient:
         batch_lists = [None] * 2
 
         while True:
+            nvtx.push_range("get_input_queue")
             model_worker_batch, future_token_ids_ct = self.input_queue.get()
             if not model_worker_batch:
                 break
@@ -130,26 +131,31 @@ class TpModelWorkerClient:
             # by pytorch and cause CUDA illegal memory access errors.
             batch_lists[batch_pt % 2] = model_worker_batch
             batch_pt += 1
-
+            nvtx.pop_range()
+            nvtx.push_range("create_event")
             # Create event
             self.launch_done = threading.Event()
             copy_done = torch.get_device_module(self.device).Event()
-
+            nvtx.pop_range()
+            nvtx.push_range("Resolve future tokens in the input")
             # Resolve future tokens in the input
             input_ids = model_worker_batch.input_ids
             resolve_future_token_ids(input_ids, self.future_token_ids_map)
-
+            nvtx.pop_range()
+            nvtx.push_range(f"run_forward batch_pt={batch_pt}")
             # Run forward
             logits_output, next_token_ids = self.worker.forward_batch_generation(
                 model_worker_batch, self.launch_done
             )
-
+            nvtx.pop_range()
+            nvtx.push_range("Update the future token ids map")
             # Update the future token ids map
             bs = len(model_worker_batch.seq_lens)
             self.future_token_ids_map[
                 future_token_ids_ct + 1 : future_token_ids_ct + bs + 1
             ] = next_token_ids
-
+            nvtx.pop_range()
+            nvtx.push_range("Copy results to the CPU")
             # Copy results to the CPU
             if model_worker_batch.return_logprob:
                 logits_output.next_token_logprobs = (
@@ -167,7 +173,7 @@ class TpModelWorkerClient:
             copy_done.record()
 
             self.output_queue.put((copy_done, logits_output, next_token_ids))
-
+            nvtx.pop_range()
     def resolve_batch_result(self, bid: int):
         copy_done, logits_output, next_token_ids = self.output_queue.get()
         copy_done.synchronize()

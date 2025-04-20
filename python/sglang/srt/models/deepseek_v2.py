@@ -22,6 +22,7 @@ from typing import Any, Dict, Iterable, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
+import nvtx
 from torch import nn
 from tqdm import tqdm
 from transformers import PretrainedConfig
@@ -132,9 +133,11 @@ class DeepseekV2MLP(nn.Module):
         self.act_fn = SiluAndMul()
 
     def forward(self, x):
+        nvtx.push_range("DeepseekV2MLP")
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
+        nvtx.pop_range()
         return x
 
 
@@ -272,10 +275,13 @@ class DeepseekV2MoE(nn.Module):
     def forward(
         self, hidden_states: torch.Tensor, forward_mode: Optional[ForwardMode] = None
     ) -> torch.Tensor:
-        if not global_server_args_dict["enable_deepep_moe"]:
-            return self.forward_normal(hidden_states)
-        else:
-            return self.forward_deepep(hidden_states, forward_mode)
+        with nvtx.annotate("DeepseekV2MoE"):
+            if not global_server_args_dict["enable_deepep_moe"]:
+                with nvtx.annotate("DeepseekV2MoE forward_normal"):
+                    return self.forward_normal(hidden_states)
+            else:
+                with nvtx.annotate("DeepseekV2MoE forward_deepep"):
+                    return self.forward_deepep(hidden_states, forward_mode)
 
     def forward_normal(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if self.n_shared_experts is not None and self.n_share_experts_fusion == 0:
@@ -720,27 +726,28 @@ class DeepseekV2AttentionMLA(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        if hidden_states.shape[0] == 0:
-            assert (
-                not self.o_proj.reduce_results
-            ), "short-circuiting allreduce will lead to hangs"
-            return hidden_states
+        with nvtx.annotate("DeepseekV2AttentionMLA"):
+            if hidden_states.shape[0] == 0:
+                assert (
+                    not self.o_proj.reduce_results
+                ), "short-circuiting allreduce will lead to hangs"
+                return hidden_states
 
-        if self.no_absorb(forward_batch):
-            return self.forward_normal(positions, hidden_states, forward_batch)
-        else:
-            if _is_hip:
-                if (
-                    self.rocm_fused_decode_mla
-                    and forward_batch.forward_mode.is_decode()
-                ):
-                    return self.forward_absorb_fused_mla_rope(
-                        positions, hidden_states, forward_batch
-                    )
+            if self.no_absorb(forward_batch):
+                return self.forward_normal(positions, hidden_states, forward_batch)
+            else:
+                if _is_hip:
+                    if (
+                        self.rocm_fused_decode_mla
+                        and forward_batch.forward_mode.is_decode()
+                    ):
+                        return self.forward_absorb_fused_mla_rope(
+                            positions, hidden_states, forward_batch
+                        )
+                    else:
+                        return self.forward_absorb(positions, hidden_states, forward_batch)
                 else:
                     return self.forward_absorb(positions, hidden_states, forward_batch)
-            else:
-                return self.forward_absorb(positions, hidden_states, forward_batch)
 
     def forward_normal(
         self,
@@ -1109,13 +1116,18 @@ class DeepseekV2DecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
     ) -> torch.Tensor:
         if global_server_args_dict["enable_deepep_moe"] and self.is_sparse:
-            return self.forward_deepep(
+            nvtx.push_range("DeepseekV2DecoderLayer deepep")
+            out = self.forward_deepep(
                 positions, hidden_states, forward_batch, residual
             )
+            nvtx.pop_range()
         else:
-            return self.forward_normal(
+            nvtx.push_range("DeepseekV2DecoderLayer normal")
+            out = self.forward_normal(
                 positions, hidden_states, forward_batch, residual
             )
+            nvtx.pop_range()
+        return out
 
     def forward_normal(
         self,
@@ -1296,24 +1308,31 @@ class DeepseekV2Model(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
-
+        nvtx.push_range("DeepseekV2Model FWD")
+        nvtx.push_range("VocabParallelEmbedding")
         if input_embeds is None:
             hidden_states = self.embed_tokens(input_ids)
         else:
             hidden_states = input_embeds
+        nvtx.pop_range()
 
         residual = None
         for i in range(len(self.layers)):
+            nvtx.push_range(f"DeepseekV2DecoderLayer {i}")
             expert_distribution_recorder.set_current_layer(i)
             layer = self.layers[i]
             hidden_states, residual = layer(
                 positions, hidden_states, forward_batch, residual
             )
+            nvtx.pop_range()
+        nvtx.push_range("RMSNorm")
         if not forward_batch.forward_mode.is_idle():
             if residual is None:
                 hidden_states = self.norm(hidden_states)
             else:
                 hidden_states, _ = self.norm(hidden_states, residual)
+        nvtx.pop_range()
+        nvtx.pop_range()
         return hidden_states
 
 
@@ -1372,12 +1391,15 @@ class DeepseekV2ForCausalLM(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
-
+        nvtx.push_range("DeepseekV2ForCausalLM")
         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
-
-        return self.logits_processor(
+        nvtx.push_range("logits_processor")
+        out = self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch
         )
+        nvtx.pop_range()
+        nvtx.pop_range()
+        return out
 
     def post_load_weights(self):
 
