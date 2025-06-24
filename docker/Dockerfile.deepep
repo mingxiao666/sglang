@@ -1,5 +1,4 @@
-ARG BASE_IMAGE
-FROM ${BASE_IMAGE}
+FROM lmsysorg/sglang:v0.4.6.post3-cu124
 
 # CMake
 RUN apt-get update \
@@ -7,10 +6,10 @@ RUN apt-get update \
 build-essential \
 wget \
 libssl-dev \
-&& wget https://github.com/Kitware/CMake/releases/download/v3.27.4/cmake-3.27.4-linux-x86_64.sh \
-&& chmod +x cmake-3.27.4-linux-x86_64.sh \
-&& ./cmake-3.27.4-linux-x86_64.sh --skip-license --prefix=/usr/local \
-&& rm cmake-3.27.4-linux-x86_64.sh
+&& wget https://github.com/Kitware/CMake/releases/download/v4.0.2/cmake-4.0.2-linux-x86_64.sh \
+&& chmod +x cmake-4.0.2-linux-x86_64.sh \
+&& ./cmake-4.0.2-linux-x86_64.sh --skip-license --prefix=/usr/local \
+&& rm cmake-4.0.2-linux-x86_64.sh
 
 # Python
 RUN apt-get update \
@@ -45,7 +44,23 @@ RUN apt-get install -y libfabric-dev
 
 # DeepEP
 WORKDIR /sgl-workspace
-RUN git clone https://github.com/deepseek-ai/DeepEP.git
+RUN mv sglang sglang.org
+# Install sglang with deepgemm patch
+RUN git clone --branch reproduction_20250612 https://github.com/mingxiao666/sglang.git
+WORKDIR /sgl-workspace/sglang/sgl-kernel
+RUN  pip install --break-system-packages uv && MAKE_BUILD_PARALLEL_LEVEL=$(nproc) make build
+WORKDIR /sgl-workspace/sglang
+RUN pip install -e "python[all]"
+
+WORKDIR /sgl-workspace
+# Apply patch first
+RUN sed -i 's/cmake_policy(VERSION 3.0)/cmake_policy(VERSION 3.5...4.0)/' /usr/lib/x86_64-linux-gnu/cmake/jsoncpp/jsoncppConfig.cmake
+RUN ln -s /usr/lib/x86_64-linux-gnu/libibverbs.so.1 /usr/lib/x86_64-linux-gnu/libibverbs.so
+RUN git clone -b reproduction_20250612 https://github.com/fzyzcjy/Mooncake.git
+WORKDIR /sgl-workspace/Mooncake
+RUN bash dependencies.sh && mkdir build && cd build && cmake .. && make -j && make install
+WORKDIR /sgl-workspace
+RUN git clone -b patch-4 https://github.com/fzyzcjy/DeepEP.git
 
 # NVSHMEM
 WORKDIR /sgl-workspace
@@ -56,8 +71,8 @@ RUN tar -xf nvshmem_src_3.2.5-1.txz \
 WORKDIR /sgl-workspace/nvshmem
 RUN git apply /sgl-workspace/DeepEP/third-party/nvshmem.patch
 
-RUN sed -i '1i#include <unistd.h>' /sgl-workspace/nvshmem/examples/moe_shuffle.cu && \
-    cat /sgl-workspace/nvshmem/examples/moe_shuffle.cu
+#RUN sed -i '1i#include <unistd.h>' /sgl-workspace/nvshmem/examples/moe_shuffle.cu && \
+#    cat /sgl-workspace/nvshmem/examples/moe_shuffle.cu
 
 WORKDIR /sgl-workspace/nvshmem
 ENV CUDA_HOME=/usr/local/cuda
@@ -79,3 +94,4 @@ RUN NVSHMEM_DIR=/sgl-workspace/nvshmem/install pip install --break-system-packag
 
 # Set workspace
 WORKDIR /sgl-workspace
+RUN pip install netifaces
