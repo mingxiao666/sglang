@@ -49,6 +49,7 @@ RUN mv sglang sglang.org
 RUN git clone --branch reproduction_20250612 https://github.com/mingxiao666/sglang.git
 WORKDIR /sgl-workspace/sglang/sgl-kernel
 RUN pip install uv && MAKE_BUILD_PARALLEL_LEVEL=$(nproc) make build
+WORKDIR /sgl-workspace/
 RUN git clone -b reproduction_20250612 https://github.com/fzyzcjy/Mooncake.git
 WORKDIR /sgl-workspace/Mooncake
 RUN bash dependencies.sh && mkdir build && cd build && cmake .. && make -j && make install
